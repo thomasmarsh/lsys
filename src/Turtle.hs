@@ -1,16 +1,20 @@
 module Turtle
     ( parse
     , lsys
-    , main1
-    , main2
+    , main3
     ) where
 
 import           Control.Monad (foldM)
+import           Data.Bool (bool)
 import qualified Data.Map as M
-import           Data.List.Split (splitOn)
+import           Data.List.Split (splitOn, keepDelimsL, split, whenElt)
 
-deg2rad :: Float -> Float
-deg2rad = (*) (pi / 180)
+import Graphics.Gloss
+
+type Coord = (Float, Float)
+type Bounds = (Coord, Coord)
+type Coords = [Coord]
+type Segments = [Coords]
 
 data Instruction
     = Forward
@@ -23,12 +27,13 @@ data Instruction
     deriving (Ord, Eq, Show)
 
 type Program = [Instruction]
-type Rules = M.Map Instruction Program
+type Rules = [(Char, String)]
+type ParsedRules = M.Map Instruction Program
 
 data State = State
-    { position :: (Float, Float)
+    { position :: Coord
     , angle :: Float
-    , stack :: [((Float, Float), Float)]
+    , stack :: [(Coord, Float)]
     } deriving (Show)
 
 data StepResult
@@ -63,12 +68,12 @@ step _ PushState state@State { position=p, angle=a, stack = s }
     = (state { stack = (p, a):s }, Nil)
 
 step _ PopState (State _ _ []) = error "attempt to pop empty stack"
-step _ PopState state@State { stack = (x:xs) }
+step _ PopState state@State { stack = ((p, a):xs) }
     = (state { position = p, angle = a, stack = xs }, uncurry Reset p)
-    where (p, a) = x
 
 walk :: Float -> Program -> State -> [StepResult]
-walk amt prog state@State {position=(initX, initY)} = reverse $ loop state prog [Point initX initY]
+walk amt prog state@State {position=(initX, initY)}
+    = reverse $ loop state prog [Point initX initY]
     where loop _ [] result = result
           loop s (x:xs) result = loop s' xs result'
             where (s', r) = step amt x s
@@ -76,29 +81,34 @@ walk amt prog state@State {position=(initX, initY)} = reverse $ loop state prog 
                                 Nil -> result
                                 _ -> r:result
 
+deg2rad :: Float -> Float
+deg2rad = (*) (pi / 180)
+
 initState :: State
 initState = State { position = (0,0), angle=deg2rad 90, stack = [] }
 
-balancedAlg :: Int -> Char -> Either String Int
-balancedAlg i '[' = Right $ i + 1
-balancedAlg i ']' | i > 0 = Right $ i - 1
-balancedAlg i ']' | i <= 0 = Left "Unbalanced"
-balancedAlg i _ = Right i
-
 balanced :: String -> Bool
-balanced s = case foldM balancedAlg 0 s of
+balanced s = case foldM go 0 s of
                Left _ -> False
                Right i -> i == 0
+    where go :: Int -> Char -> Either String Int
+          go i '[' = Right $ i + 1
+          go i ']' | i > 0 = Right $ i - 1
+          go i ']' | i <= 0 = Left "Unbalanced"
+          go i _ = Right i
+
+parseChar :: Char -> Instruction
+parseChar 'F' = Forward
+parseChar 'f' = ForwardBlank
+parseChar '-' = CounterClockwise
+parseChar '+' = Clockwise
+parseChar '[' = PushState
+parseChar ']' = PopState
+parseChar x   = Variable x
 
 parse :: String -> Program
-parse [] = []
-parse ('F':xs) = Forward          : parse xs
-parse ('f':xs) = ForwardBlank     : parse xs
-parse ('-':xs) = CounterClockwise : parse xs
-parse ('+':xs) = Clockwise        : parse xs
-parse ('[':xs) = PushState        : parse xs
-parse (']':xs) = PopState         : parse xs
-parse (x:xs)   = Variable x       : parse xs
+parse x | not (balanced x) = error ("unbalanced brackets: " ++ x)
+parse x = map parseChar x
 
 unparse :: Program -> String
 unparse [] = []
@@ -110,20 +120,32 @@ unparse (PushState        : xs) = '[' : unparse xs
 unparse (PopState         : xs) = ']' : unparse xs
 unparse (Variable x       : xs) = x : unparse xs
 
-rewrite :: Rules -> Program -> Program
-rewrite r = foldr (\x -> (++) (M.findWithDefault [x] x r)) []
+parseRules :: Rules -> ParsedRules
+parseRules r = M.fromList $ map f r
+    where f (c, p) = (parseChar c, parse p)
 
-paths :: [StepResult] -> [[(Float, Float)]]
-paths [] = []
-paths xs = map f split
-    where split = splitOn [Break] xs
-          f = map (\x -> case x of
-                            Reset x y -> (x, y)
-                            Point x y -> (x, y)
-                            _ -> error "unexpected entry in path")
+rewrite :: ParsedRules -> Program -> Program
+rewrite r = foldr (\x -> (++) (M.findWithDefault [x] x r)) []
 
 -- foldl is dramatically slower, but uses very little memory
 -- rewrite r = foldl' (\result x -> result ++ M.findWithDefault [x] x r) []
+
+dropNull = filter (not . null)
+
+splitSteps :: [StepResult] -> [[StepResult]]
+splitSteps xs
+    = dropNull $ concatMap reset broken
+    where broken = dropNull $ splitOn [Break] xs
+          reset = split (keepDelimsL $ whenElt isReset)
+          isReset elt = case elt of
+                            Reset _ _ -> True
+                            _ -> False
+
+paths :: [StepResult] -> Segments
+paths xs = map (map toPoint) (splitSteps xs)
+    where toPoint (Point x y) = (x, y)
+          toPoint (Reset x y) = (x, y)
+          toPoint _ = error "unexpected entry in path"
 
 nTimes :: Int -> (a -> a) -> a -> a
 nTimes 0 _ x = x
@@ -136,22 +158,77 @@ printCoords =
                     Reset x y -> putStrLn $ "    (nan, nan),\n    (" ++ show x ++ ", " ++ show y ++ "),"
                     Break -> putStrLn "    (nan, nan),")
 
-lsys :: Program -> Rules -> Int -> Float -> [[(Float, Float)]]
-lsys prog r n a = paths $ walk a (nTimes n (rewrite r) prog) initState
+lsys :: String -> ParsedRules -> Int -> Float -> Segments
+lsys prog rules n angle
+    = paths $ walk angle iterated initState
+    where iterated = nTimes n (rewrite rules) (parse prog)
 
-example :: Rules
-example = M.fromList
-            [ (Variable 'X', parse "F[-X][X]F[-X]+FX")
-            , (Forward,      parse "FF")]
+example :: ParsedRules
+example = parseRules [
+            ('X', "F[-X][X]F[-X]+FX"),
+            ('F', "FF")]
 
-emptyRules :: Rules
+center :: Bounds -> Coord
+center ((mx, my), (nx, ny)) = (cx, cy)
+    where cx = (mx - nx) / 2
+          cy = (my - ny) / 2
+
+bounds :: Segments -> Bounds
+bounds ls = loop ((0, 0), (0, 0)) (concat ls)
+    where loop result [] = result
+          loop ((mx, my), (nx, ny)) ((x, y):xs)
+            = loop ((mx', my'), (nx', ny')) xs
+            where mx' = max x mx
+                  my' = max y my
+                  nx' = min x nx
+                  ny' = min y ny
+
+margin :: Float -> Bounds -> Float
+margin pct ((mx, my), (nx, ny)) = abs $ pct * w
+    where wx = mx - nx
+          wy = my - ny
+          w = max wx wy / 2
+
+scale' :: Bounds -> Float
+scale' = margin 1
+
+applyMargin :: Float -> Bounds -> Bounds
+applyMargin pct b@((mx, my), (nx, ny))
+    = ((mx+w, my+w), (nx-w, ny-w))
+    where w = margin pct b
+
+emptyRules :: ParsedRules
 emptyRules = M.empty
 
-main1 :: IO ()
-main1 =
-    mapM_ print (lsys (parse "X") example 6 (deg2rad 25))
+colors :: [Color]
+colors = cycle [red, green, blue, yellow, cyan, magenta, rose,
+                violet, azure, aquamarine, chartreuse, orange]
 
-main2 :: IO ()
-main2 = do
-    let prog = parse "F-F+F+F+f+F+F+F-F"
-    mapM_ print (lsys prog emptyRules 6 (deg2rad 45))
+drawBounds :: Bounds -> Picture
+drawBounds ((mx, my), (nx, ny)) = Pictures ps
+    where coords = [(nx, my), (mx, my),
+                    (mx, ny), (nx, ny)]
+          ps = [ Translate x y $ Color c $ circleSolid 2
+               | ((x, y), c) <- zip coords colors]
+
+main3 :: IO ()
+main3 = do
+    let screen = (800, 800)
+    let ps = lsys "X" example 9 (deg2rad 25)
+    let b = applyMargin 0.1 (bounds ps)
+    let c = center b
+    let cx = round (fst c)
+    let cy = negate $ round (snd c)
+    let sc = 800* scale' b
+    putStrLn $ "Bounds: " ++ show (bounds ps)
+    putStrLn $ "Margin: " ++ show (margin 0.1 b)
+    putStrLn $ "Bounds': " ++ show (applyMargin 0.1 b)
+    putStrLn $ "Center': " ++ show c
+    putStrLn $ "Center::Int: " ++ show (cx, cy)
+    putStrLn $ "Scale: " ++ show (scale' b)
+    let n = 0.04
+    let s = Scale (n * scale' b) (n * scale' b)
+    let ps' = Pictures [
+                drawBounds $ bounds ps,
+                Pictures $ zipWith Color colors (map Line ps)]
+    display (InWindow "LSys" screen (-(cx*10), -(cy*10))) black (s ps')

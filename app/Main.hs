@@ -3,4 +3,4 @@ module Main where
 import Turtle
 
 main :: IO ()
-main = main1
+main = main3
