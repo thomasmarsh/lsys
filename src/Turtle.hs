@@ -11,6 +11,10 @@ import           Data.List.Split (splitOn, keepDelimsL, split, whenElt)
 
 import Graphics.Gloss
 
+--
+-- Types
+--
+
 type Coord = (Float, Float)
 type Bounds = (Coord, Coord)
 type Coords = [Coord]
@@ -30,18 +34,29 @@ type Program = [Instruction]
 type Rules = [(Char, String)]
 type ParsedRules = M.Map Instruction Program
 
-data State = State
-    { position :: Coord
-    , angle :: Float
-    , stack :: [(Coord, Float)]
-    } deriving (Show)
-
 data StepResult
     = Point Float Float
     | Reset Float Float
     | Break
     | Nil
     deriving (Eq, Show)
+
+data State = State
+    { position :: Coord
+    , angle :: Float
+    , stack :: [(Coord, Float)]
+    } deriving (Show)
+
+deg2rad :: Float -> Float
+deg2rad = (*) (pi / 180)
+
+initState :: State
+initState = State { position = (0,0), angle=deg2rad 90, stack = [] }
+
+
+--
+-- Walking
+--
 
 forward :: State -> State
 forward state@State { position=(x, y), angle=a }
@@ -81,21 +96,24 @@ walk amt prog state@State {position=(initX, initY)}
                                 Nil -> result
                                 _ -> r:result
 
-deg2rad :: Float -> Float
-deg2rad = (*) (pi / 180)
 
-initState :: State
-initState = State { position = (0,0), angle=deg2rad 90, stack = [] }
+--
+-- Parsing
+--
 
 balanced :: String -> Bool
 balanced s = case foldM go 0 s of
                Left _ -> False
                Right i -> i == 0
-    where go :: Int -> Char -> Either String Int
+    where go :: Int -> Char -> Either () Int
           go i '[' = Right $ i + 1
           go i ']' | i > 0 = Right $ i - 1
-          go i ']' | i <= 0 = Left "Unbalanced"
+          go i ']' | i <= 0 = Left ()
           go i _ = Right i
+
+parse :: String -> Program
+parse x | not (balanced x) = error ("unbalanced brackets: " ++ x)
+parse x = map parseChar x
 
 parseChar :: Char -> Instruction
 parseChar 'F' = Forward
@@ -106,23 +124,26 @@ parseChar '[' = PushState
 parseChar ']' = PopState
 parseChar x   = Variable x
 
-parse :: String -> Program
-parse x | not (balanced x) = error ("unbalanced brackets: " ++ x)
-parse x = map parseChar x
-
 unparse :: Program -> String
-unparse [] = []
-unparse (Forward          : xs) = 'F' : unparse xs
-unparse (ForwardBlank     : xs) = 'f' : unparse xs
-unparse (CounterClockwise : xs) = '-' : unparse xs
-unparse (Clockwise        : xs) = '+' : unparse xs
-unparse (PushState        : xs) = '[' : unparse xs
-unparse (PopState         : xs) = ']' : unparse xs
-unparse (Variable x       : xs) = x : unparse xs
+unparse = map unparseChar
+
+unparseChar :: Instruction -> Char
+unparseChar Forward          = 'F'
+unparseChar ForwardBlank     = 'f'
+unparseChar CounterClockwise = '-'
+unparseChar Clockwise        = '+'
+unparseChar PushState        = '['
+unparseChar PopState         = ']'
+unparseChar (Variable x)     = x
 
 parseRules :: Rules -> ParsedRules
 parseRules r = M.fromList $ map f r
     where f (c, p) = (parseChar c, parse p)
+
+
+--
+-- Rule application
+--
 
 rewrite :: ParsedRules -> Program -> Program
 rewrite r = foldr (\x -> (++) (M.findWithDefault [x] x r)) []
@@ -130,7 +151,19 @@ rewrite r = foldr (\x -> (++) (M.findWithDefault [x] x r)) []
 -- foldl is dramatically slower, but uses very little memory
 -- rewrite r = foldl' (\result x -> result ++ M.findWithDefault [x] x r) []
 
-dropNull = filter (not . null)
+nTimes :: Int -> (a -> a) -> a -> a
+nTimes 0 _ x = x
+nTimes n f x = f $ nTimes (n-1) f x
+
+lsys :: String -> ParsedRules -> Int -> Float -> Segments
+lsys prog rules n angle
+    = paths $ walk angle iterated initState
+    where iterated = nTimes n (rewrite rules) (parse prog)
+
+
+--
+-- Conversion to screen values
+--
 
 splitSteps :: [StepResult] -> [[StepResult]]
 splitSteps xs
@@ -140,33 +173,13 @@ splitSteps xs
           isReset elt = case elt of
                             Reset _ _ -> True
                             _ -> False
+          dropNull = filter (not . null)
 
 paths :: [StepResult] -> Segments
 paths xs = map (map toPoint) (splitSteps xs)
     where toPoint (Point x y) = (x, y)
           toPoint (Reset x y) = (x, y)
           toPoint _ = error "unexpected entry in path"
-
-nTimes :: Int -> (a -> a) -> a -> a
-nTimes 0 _ x = x
-nTimes n f x = f $ nTimes (n-1) f x
-
-printCoords :: [StepResult] -> IO ()
-printCoords =
-    mapM_ (\s -> case s of
-                    Point x y -> putStrLn $ "    (" ++ show x ++ ", " ++ show y ++ "),"
-                    Reset x y -> putStrLn $ "    (nan, nan),\n    (" ++ show x ++ ", " ++ show y ++ "),"
-                    Break -> putStrLn "    (nan, nan),")
-
-lsys :: String -> ParsedRules -> Int -> Float -> Segments
-lsys prog rules n angle
-    = paths $ walk angle iterated initState
-    where iterated = nTimes n (rewrite rules) (parse prog)
-
-example :: ParsedRules
-example = parseRules [
-            ('X', "F[-X][X]F[-X]+FX"),
-            ('F', "FF")]
 
 center :: Bounds -> Coord
 center ((mx, my), (nx, ny)) = (cx, cy)
@@ -197,8 +210,17 @@ applyMargin pct b@((mx, my), (nx, ny))
     = ((mx+w, my+w), (nx-w, ny-w))
     where w = margin pct b
 
-emptyRules :: ParsedRules
-emptyRules = M.empty
+
+--
+-- Debugging
+--
+
+printCoords :: [StepResult] -> IO ()
+printCoords =
+    mapM_ (\s -> case s of
+                    Point x y -> putStrLn $ "    (" ++ show x ++ ", " ++ show y ++ "),"
+                    Reset x y -> putStrLn $ "    (nan, nan),\n    (" ++ show x ++ ", " ++ show y ++ "),"
+                    Break -> putStrLn "    (nan, nan),")
 
 colors :: [Color]
 colors = cycle [red, green, blue, yellow, cyan, magenta, rose,
@@ -213,6 +235,9 @@ drawBounds ((mx, my), (nx, ny)) = Pictures ps
 
 main3 :: IO ()
 main3 = do
+    let example = parseRules [
+                    ('X', "F[-X][X]F[-X]+FX"),
+                    ('F', "FF")]
     let screen = (800, 800)
     let ps = lsys "X" example 9 (deg2rad 25)
     let b = applyMargin 0.1 (bounds ps)
