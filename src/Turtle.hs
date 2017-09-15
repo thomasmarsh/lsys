@@ -1,11 +1,11 @@
 module Turtle
     ( parse
     , lsys
+    , examples
     , main3
     ) where
 
 import           Control.Monad (foldM)
-import           Data.Bool (bool)
 import qualified Data.Map as M
 import           Data.List.Split (splitOn, keepDelimsL, split, whenElt)
 
@@ -31,7 +31,9 @@ data Instruction
     deriving (Ord, Eq, Show)
 
 type Program = [Instruction]
+
 type Rules = [(Char, String)]
+
 type ParsedRules = M.Map Instruction Program
 
 data StepResult
@@ -40,6 +42,8 @@ data StepResult
     | Break
     | Nil
     deriving (Eq, Show)
+
+type LSystem = (String, Float, Int, Rules)
 
 data State = State
     { position :: Coord
@@ -67,7 +71,7 @@ forward state@State { position=(x, y), angle=a }
 turn :: Float -> State -> State
 turn amt state@State { angle=a }
     = state { angle = a+amt }
-    
+
 step :: Float -> Instruction -> State -> (State, StepResult)
 step _ Forward state
     = (state', Point x' y')
@@ -124,17 +128,17 @@ parseChar '[' = PushState
 parseChar ']' = PopState
 parseChar x   = Variable x
 
-unparse :: Program -> String
-unparse = map unparseChar
+_unparse :: Program -> String
+_unparse = map _unparseChar
 
-unparseChar :: Instruction -> Char
-unparseChar Forward          = 'F'
-unparseChar ForwardBlank     = 'f'
-unparseChar CounterClockwise = '-'
-unparseChar Clockwise        = '+'
-unparseChar PushState        = '['
-unparseChar PopState         = ']'
-unparseChar (Variable x)     = x
+_unparseChar :: Instruction -> Char
+_unparseChar Forward          = 'F'
+_unparseChar ForwardBlank     = 'f'
+_unparseChar CounterClockwise = '-'
+_unparseChar Clockwise        = '+'
+_unparseChar PushState        = '['
+_unparseChar PopState         = ']'
+_unparseChar (Variable x)     = x
 
 parseRules :: Rules -> ParsedRules
 parseRules r = M.fromList $ map f r
@@ -149,16 +153,16 @@ rewrite :: ParsedRules -> Program -> Program
 rewrite r = foldr (\x -> (++) (M.findWithDefault [x] x r)) []
 
 -- foldl is dramatically slower, but uses very little memory
--- rewrite r = foldl' (\result x -> result ++ M.findWithDefault [x] x r) []
+-- rewrite r = foldl' (\z x -> z ++ M.findWithDefault [x] x r) []
 
 nTimes :: Int -> (a -> a) -> a -> a
 nTimes 0 _ x = x
 nTimes n f x = f $ nTimes (n-1) f x
 
-lsys :: String -> ParsedRules -> Int -> Float -> Segments
-lsys prog rules n angle
-    = paths $ walk angle iterated initState
-    where iterated = nTimes n (rewrite rules) (parse prog)
+lsys :: LSystem -> Segments
+lsys (prog, a, n, rules)
+    = paths $ walk a iterated initState
+    where iterated = nTimes n (rewrite (parseRules rules)) (parse prog)
 
 
 --
@@ -183,8 +187,8 @@ paths xs = map (map toPoint) (splitSteps xs)
 
 center :: Bounds -> Coord
 center ((mx, my), (nx, ny)) = (cx, cy)
-    where cx = (mx - nx) / 2
-          cy = (my - ny) / 2
+    where cx = nx + (mx - nx) / 2
+          cy = ny + (my - ny) / 2
 
 bounds :: Segments -> Bounds
 bounds ls = loop ((0, 0), (0, 0)) (concat ls)
@@ -202,8 +206,10 @@ margin pct ((mx, my), (nx, ny)) = abs $ pct * w
           wy = my - ny
           w = max wx wy / 2
 
-scale' :: Bounds -> Float
-scale' = margin 1
+scaleToScreen :: (Int, Int) -> Bounds -> Float
+scaleToScreen (sx, sy) ((mx, my), (nx, ny)) = r'
+    where r s m n = fromIntegral s / ((m-n) / 2)
+          r' = min (r sx mx nx) (r sy my ny)
 
 applyMargin :: Float -> Bounds -> Bounds
 applyMargin pct b@((mx, my), (nx, ny))
@@ -212,19 +218,8 @@ applyMargin pct b@((mx, my), (nx, ny))
 
 
 --
--- Debugging
+-- Drawing
 --
-
-printCoords :: [StepResult] -> IO ()
-printCoords =
-    mapM_ (\s -> case s of
-                    Point x y -> putStrLn $ "    (" ++ show x ++ ", " ++ show y ++ "),"
-                    Reset x y -> putStrLn $ "    (nan, nan),\n    (" ++ show x ++ ", " ++ show y ++ "),"
-                    Break -> putStrLn "    (nan, nan),")
-
-colors :: [Color]
-colors = cycle [red, green, blue, yellow, cyan, magenta, rose,
-                violet, azure, aquamarine, chartreuse, orange]
 
 drawBounds :: Bounds -> Picture
 drawBounds ((mx, my), (nx, ny)) = Pictures ps
@@ -233,27 +228,102 @@ drawBounds ((mx, my), (nx, ny)) = Pictures ps
           ps = [ Translate x y $ Color c $ circleSolid 2
                | ((x, y), c) <- zip coords colors]
 
+colors :: [Color]
+colors = repeat green
+-- colors = cycle [ red, green, blue, yellow, cyan, magenta, rose,
+--                  violet, azure, aquamarine, chartreuse, orange]
+
+
+draw :: Segments -> (Int, Int) -> Picture
+draw ps screen = Translate sx sy $ Scale sc sc $ Pictures [
+                    drawBounds $ bounds ps,
+                    Pictures $ zipWith Color colors (map Line ps)]
+    where
+        b = applyMargin 0.1 (bounds ps)
+        sc = scaleToScreen screen b / 2
+        c = center b
+        cx = round $ fst c :: Integer
+        cy = negate $ round $ snd c :: Integer
+        sx = sc * fromIntegral cx
+        sy = sc * fromIntegral cy
+
+
+--
+-- L-systems
+--
+
+hilbert :: LSystem
+hilbert
+    = ("L", deg2rad 90, 6, [
+        ('L', "+RF-LFL-FR+"),
+        ('R', "-LF+RFR+FL-")])
+
+plant :: LSystem
+plant
+    = ("X", deg2rad 25, 6, [
+        ('X', "F[-X][X]F[-X]+FX"),
+        ('F', "FF")])
+
+kochCurve :: LSystem
+kochCurve
+    = ("F", deg2rad 60, 6, [
+        ('F', "F+F--F+F")])
+
+kochIsland :: LSystem
+kochIsland
+    = ("F", deg2rad 90, 6, [
+        ('F', "F-F+F+FFF-F-F+F)")])
+
+curve32Segment :: LSystem
+curve32Segment
+    = ("F", deg2rad 90, 4, [
+        ('F', "-F+F-F-F+F+FF-F+F+FF+F-F-FF+FF-FF+F+F-FF-F-F+FF-F-F+F+F-F+")])
+
+peanoGosperCurve :: LSystem
+peanoGosperCurve
+    = ("X", deg2rad 60, 4, [
+        ('X', "X+YF++YF-FX--FXFX-YF+"),
+        ('Y', "-FX+YFYF++YF+FX--FX-Y")])
+
+peanoCurve :: LSystem
+peanoCurve
+    = ("F", deg2rad 90, 5, [
+        ('F', "F+F-F-F-F+F+F+F-F")])
+
+hilbert2 :: LSystem
+hilbert2
+    = ("X", deg2rad 90, 5, [
+        ('X', "XFYFX+F+YFXFY-F-XFYFX"),
+        ('Y', "YFXFY-F-XFYFX+F+YFXFY")])
+
+examples :: [LSystem]
+examples
+    = [ hilbert
+      , plant
+      , kochCurve
+      , kochIsland
+      , curve32Segment
+      , peanoGosperCurve
+      , peanoCurve
+      , hilbert2
+      ]
+
+--
+-- Debugging
+--
+
+_printCoords :: [StepResult] -> IO ()
+_printCoords =
+    mapM_ (\s -> case s of
+                    Point x y -> putStrLn $ "    (" ++ show x ++ ", " ++ show y ++ "),"
+                    Reset x y -> putStrLn $ "    (nan, nan),\n    (" ++ show x ++ ", " ++ show y ++ "),"
+                    Break -> putStrLn "    (nan, nan),"
+                    Nil -> putStrLn "    Nil,")
+
+
+
 main3 :: IO ()
 main3 = do
-    let example = parseRules [
-                    ('X', "F[-X][X]F[-X]+FX"),
-                    ('F', "FF")]
-    let screen = (800, 800)
-    let ps = lsys "X" example 9 (deg2rad 25)
-    let b = applyMargin 0.1 (bounds ps)
-    let c = center b
-    let cx = round (fst c)
-    let cy = negate $ round (snd c)
-    let sc = 800* scale' b
-    putStrLn $ "Bounds: " ++ show (bounds ps)
-    putStrLn $ "Margin: " ++ show (margin 0.1 b)
-    putStrLn $ "Bounds': " ++ show (applyMargin 0.1 b)
-    putStrLn $ "Center': " ++ show c
-    putStrLn $ "Center::Int: " ++ show (cx, cy)
-    putStrLn $ "Scale: " ++ show (scale' b)
-    let n = 0.04
-    let s = Scale (n * scale' b) (n * scale' b)
-    let ps' = Pictures [
-                drawBounds $ bounds ps,
-                Pictures $ zipWith Color colors (map Line ps)]
-    display (InWindow "LSys" screen (-(cx*10), -(cy*10))) black (s ps')
+    let ps = lsys (last examples)
+    let screen = (1000, 1000)
+    display (InWindow "LSys" screen (0, 0)) black (draw ps screen)
